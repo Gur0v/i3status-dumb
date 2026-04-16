@@ -1,6 +1,6 @@
 mod clock;
+mod layout;
 mod status;
-mod sway;
 mod volume;
 
 use tokio::sync::watch;
@@ -13,7 +13,7 @@ async fn main() {
 
     clock::spawn(time_tx);
     volume::spawn(vol_tx);
-    sway::spawn(layout_tx);
+    layout::spawn(layout_tx);
 
     let mut vol_rx = vol_rx;
     let mut layout_rx = layout_rx;

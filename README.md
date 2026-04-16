@@ -1,6 +1,6 @@
 # i3status-dumb
 
-My tiny status generator for `swaybar`.
+My tiny status generator for `swaybar` or `i3bar`.
 
 I wrote this for my own setup and I am mostly throwing the source code out into the wild in case it is useful to someone else. It is not meant to be a general-purpose status bar or a polished replacement for anything.
 
@@ -20,7 +20,7 @@ The goal is simple:
 Right now it shows:
 
 - volume from PipeWire or PulseAudio tools
-- active keyboard layout from Sway IPC
+- active keyboard layout
 - local clock, updated every second
 
 ## How It Works
@@ -29,8 +29,8 @@ The program runs three async watchers and prints a new line whenever any of them
 
 - `src/volume.rs`
   Uses `pactl subscribe` for push events, then asks `wpctl get-volume @DEFAULT_AUDIO_SINK@` for current sink volume.
-- `src/sway.rs`
-  Connects directly to `SWAYSOCK`, fetches current inputs, subscribes to `input` events, then extracts `xkb_active_layout_name`.
+- `src/layout.rs`
+  Auto-detects the session. On Sway it connects directly to `SWAYSOCK`, fetches current inputs, subscribes to `input` events, and extracts `xkb_active_layout_name`. Outside Sway it falls back to `setxkbmap -query`, which works for my i3/X11 setup.
 - `src/clock.rs`
   Uses a `tokio` interval ticking once per second.
 - `src/main.rs`
@@ -43,7 +43,7 @@ This repo assumes a setup close to mine:
 - Rust toolchain
 - `pactl`
 - `wpctl`
-- Sway with `SWAYSOCK` set
+- either Sway with `SWAYSOCK` set, or i3/X11 with `setxkbmap`
 
 On Arch I would install:
 
@@ -61,6 +61,7 @@ If your distro splits packages differently, the important part is:
 
 - `pactl` command available
 - `wpctl` command available
+- `setxkbmap` command available if you want i3/X11 layout support
 - active PipeWire or PulseAudio-compatible audio session
 
 ## Build
@@ -77,7 +78,7 @@ target/release/i3status-dumb
 
 ## Run
 
-Inside Sway session:
+Inside your WM session:
 
 ```sh
 ./target/release/i3status-dumb
@@ -85,9 +86,9 @@ Inside Sway session:
 
 You should see live-updating lines on stdout.
 
-## Use With `swaybar`
+## Use With `swaybar` or `i3bar`
 
-Example `~/.config/sway/config` block:
+Example `~/.config/sway/config` or `~/.config/i3/config` block:
 
 ```conf
 bar {
@@ -111,7 +112,10 @@ bar {
 
 ## Behavior Notes
 
-- If `SWAYSOCK` missing, layout stays `??`.
+- Layout backend is auto-detected.
+- If `SWAYSOCK` is set, the Sway IPC watcher is used.
+- Otherwise the program falls back to `setxkbmap -query` for i3/X11.
+- If neither path works, layout stays `??`.
 - If audio tools cannot reach session daemon, volume stays `??%`.
 - Layout mapping currently special-cases:
   - `English (US)` -> `us`
@@ -127,13 +131,14 @@ This stays intentionally small:
 
 - one binary
 - one line of output
-- direct Sway IPC for layout
+- direct Sway IPC when available
+- simple X11 fallback for i3
 - event-driven volume refresh
 - tiny codebase
 
 ## Current Limits
 
-- built for Sway sessions, not generic X11/i3 IPC
+- only tested against my own Sway and i3-style setups
 - output format hardcoded
 - no battery, network, CPU, RAM, weather, or fancy bar protocol
 
