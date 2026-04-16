@@ -28,7 +28,7 @@ Right now it shows:
 The program runs three async watchers and prints a new line whenever any of them changes state.
 
 - `src/volume.rs`
-  Uses `pactl subscribe` for push events, then asks `wpctl get-volume @DEFAULT_AUDIO_SINK@` for current sink volume.
+  Uses `pactl subscribe` for push events, then reads the default sink, volume, and mute state through `pactl`.
 - `src/layout.rs`
   Auto-detects the session. On Sway it connects directly to `SWAYSOCK`, fetches current inputs, subscribes to `input` events, and extracts `xkb_active_layout_name`. Outside Sway it falls back to `setxkbmap -query`, which works for my i3/X11 setup.
 - `src/clock.rs`
@@ -42,7 +42,6 @@ This repo assumes a setup close to mine:
 
 - Rust toolchain
 - `pactl`
-- `wpctl`
 - either Sway with `SWAYSOCK` set, or i3/X11 with `setxkbmap`
 
 On Arch I would install:
@@ -60,7 +59,6 @@ sudo apt install cargo pulseaudio-utils wireplumber pipewire-bin
 If your distro splits packages differently, the important part is:
 
 - `pactl` command available
-- `wpctl` command available
 - `setxkbmap` command available if you want i3/X11 layout support
 - active PipeWire or PulseAudio-compatible audio session
 

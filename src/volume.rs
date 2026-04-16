@@ -5,24 +5,37 @@ use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
 
-const DEFAULT_SINK: &str = "@DEFAULT_AUDIO_SINK@";
-
-fn parse_wpctl_output(output: &str) -> Option<String> {
-    let muted = output.contains("[MUTED]");
-    let volume = output
-        .split_whitespace()
-        .find_map(|part| part.parse::<f32>().ok())?;
-
-    if muted {
-        Some(String::from("0%"))
+fn parse_default_sink(output: &str) -> Option<String> {
+    let sink = output.trim();
+    if sink.is_empty() {
+        None
     } else {
-        Some(format!("{}%", (volume * 100.0).round() as u32))
+        Some(sink.to_owned())
     }
 }
 
-async fn read_volume() -> Option<String> {
-    let output = Command::new("wpctl")
-        .args(["get-volume", DEFAULT_SINK])
+fn parse_pactl_volume(output: &str) -> Option<u32> {
+    output
+        .split('/')
+        .nth(1)?
+        .trim()
+        .strip_suffix('%')?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+fn parse_pactl_mute(output: &str) -> Option<bool> {
+    let state = output.split_once(':')?.1.trim();
+    match state {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+async fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args)
         .output()
         .await
         .ok()?;
@@ -31,7 +44,27 @@ async fn read_volume() -> Option<String> {
         return None;
     }
 
-    parse_wpctl_output(&String::from_utf8_lossy(&output.stdout))
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn read_default_sink() -> Option<String> {
+    let output = command_output("pactl", &["get-default-sink"]).await?;
+    parse_default_sink(&output)
+}
+
+async fn read_volume() -> Option<String> {
+    let sink = read_default_sink().await?;
+    let volume_output = command_output("pactl", &["get-sink-volume", &sink]).await?;
+    let mute_output = command_output("pactl", &["get-sink-mute", &sink]).await?;
+
+    let muted = parse_pactl_mute(&mute_output)?;
+    let volume = parse_pactl_volume(&volume_output)?;
+
+    if muted {
+        Some(String::from("0%"))
+    } else {
+        Some(format!("{volume}%"))
+    }
 }
 
 fn publish(tx: &watch::Sender<String>, next: String) {
