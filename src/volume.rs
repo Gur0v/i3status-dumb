@@ -1,80 +1,18 @@
-use std::process::Stdio;
+use std::sync::mpsc;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use libpulse_binding as pulse;
+use pulse::callbacks::ListResult;
+use pulse::context::introspect::SinkInfo;
+use pulse::context::subscribe::{Facility, InterestMaskSet, Operation};
+use pulse::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
+use pulse::mainloop::standard::{IterateResult, Mainloop};
+use pulse::proplist::Proplist;
 use tokio::sync::watch;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{sleep, Duration};
 
 use crate::status::VolumeState;
 
-const COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
-
-fn parse_pactl_volume(output: &[u8]) -> Option<u16> {
-    let text = std::str::from_utf8(output).ok()?;
-    let bytes = text.as_bytes();
-    let mut index = 0usize;
-
-    while index < bytes.len() {
-        if !bytes[index].is_ascii_digit() {
-            index += 1;
-            continue;
-        }
-
-        let start = index;
-        let mut value = 0u16;
-
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            value = value
-                .saturating_mul(10)
-                .saturating_add((bytes[index] - b'0') as u16);
-            index += 1;
-        }
-
-        if index < bytes.len()
-            && bytes[index] == b'%'
-            && start > 0
-            && bytes[start - 1].is_ascii_whitespace()
-        {
-            return Some(value.min(999));
-        }
-    }
-
-    None
-}
-
-fn parse_pactl_mute(output: &[u8]) -> Option<bool> {
-    let text = std::str::from_utf8(output).ok()?;
-    let (_, state) = text.split_once(':')?;
-    match state.trim().to_ascii_lowercase().as_str() {
-        "yes" | "true" | "1" => Some(true),
-        "no" | "false" | "0" => Some(false),
-        _ => None,
-    }
-}
-
-async fn command_output(program: &str, args: &[&str]) -> Option<Vec<u8>> {
-    let output = timeout(COMMAND_TIMEOUT, Command::new(program).args(args).output())
-        .await
-        .ok()?
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    Some(output.stdout)
-}
-
-async fn read_volume() -> Option<VolumeState> {
-    let volume_output = command_output("pactl", &["get-sink-volume", "@DEFAULT_SINK@"]).await?;
-    let mute_output = command_output("pactl", &["get-sink-mute", "@DEFAULT_SINK@"]).await?;
-
-    Some(VolumeState::new(
-        parse_pactl_volume(&volume_output)?,
-        parse_pactl_mute(&mute_output)?,
-    ))
-}
 
 fn publish(tx: &watch::Sender<VolumeState>, next: VolumeState) {
     let _ = tx.send_if_modified(|current| {
@@ -87,56 +25,142 @@ fn publish(tx: &watch::Sender<VolumeState>, next: VolumeState) {
     });
 }
 
-fn should_refresh(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("on sink")
-        || lower.contains("on server")
-        || lower.contains("on card")
-        || lower.contains("on source")
+fn percent_from_raw(avg: u32, normal: u32) -> u16 {
+    let normal = normal.max(1);
+    let rounded = avg
+        .saturating_mul(100)
+        .saturating_add(normal / 2)
+        / normal;
+    rounded.min(999) as u16
 }
 
-async fn forward_current_volume(tx: &watch::Sender<VolumeState>) {
-    if let Some(volume) = read_volume().await {
-        publish(tx, volume);
+fn volume_from_sink(info: &SinkInfo<'_>) -> VolumeState {
+    let avg = info.volume.avg().0;
+    let normal = pulse::volume::Volume::NORMAL.0;
+    VolumeState::new(percent_from_raw(avg, normal), info.mute)
+}
+
+fn iterate(mainloop: &mut Mainloop) -> Result<(), String> {
+    match mainloop.iterate(true) {
+        IterateResult::Quit(_) | IterateResult::Err(_) => Err(String::from("pulse mainloop stopped")),
+        IterateResult::Success(_) => Ok(()),
     }
 }
 
-async fn watch_subscription(tx: &watch::Sender<VolumeState>) -> std::io::Result<()> {
-    let mut child = Command::new("pactl")
-        .arg("subscribe")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
-        return Err(std::io::Error::other("missing pactl stdout"));
-    };
-
-    let mut lines = BufReader::new(stdout).lines();
-    forward_current_volume(tx).await;
-
-    while let Some(line) = lines.next_line().await? {
-        if should_refresh(&line) {
-            forward_current_volume(tx).await;
+fn wait_for_context_ready(mainloop: &mut Mainloop, context: &Context) -> Result<(), String> {
+    loop {
+        match context.get_state() {
+            ContextState::Ready => return Ok(()),
+            ContextState::Failed | ContextState::Terminated => {
+                return Err(String::from("pulse context failed"))
+            }
+            _ => iterate(mainloop)?,
         }
     }
+}
 
-    match child.wait().await {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            format!("pactl subscribe exited with status {status}"),
-        )),
-        Err(error) => Err(error),
+fn wait_for_operation<T: ?Sized>(
+    mainloop: &mut Mainloop,
+    operation: pulse::operation::Operation<T>,
+) -> Result<(), String> {
+    while operation.get_state() == pulse::operation::State::Running {
+        iterate(mainloop)?;
+    }
+    Ok(())
+}
+
+fn request_default_sink_volume(
+    context: &Context,
+    mainloop: &mut Mainloop,
+    out: &watch::Sender<VolumeState>,
+) -> Result<(), String> {
+    let (server_tx, server_rx) = mpsc::channel();
+    let operation = context.introspect().get_server_info(move |info| {
+        let default = info.default_sink_name.as_ref().map(|name| name.to_string());
+        let _ = server_tx.send(default);
+    });
+    wait_for_operation(mainloop, operation)?;
+
+    let Some(default_sink) = server_rx.recv().map_err(|error| error.to_string())? else {
+        return Ok(());
+    };
+
+    let (sink_tx, sink_rx) = mpsc::channel();
+    let operation = context
+        .introspect()
+        .get_sink_info_by_name(&default_sink, move |result| match result {
+            ListResult::Item(info) => {
+                let _ = sink_tx.send(volume_from_sink(info));
+            }
+            ListResult::End | ListResult::Error => {}
+        });
+    wait_for_operation(mainloop, operation)?;
+
+    if let Some(volume) = sink_rx.try_iter().last() {
+        publish(out, volume);
+    }
+
+    Ok(())
+}
+
+fn should_refresh(facility: Option<Facility>, _operation: Option<Operation>) -> bool {
+    matches!(
+        facility,
+        Some(Facility::Sink) | Some(Facility::Server) | Some(Facility::Card)
+    )
+}
+
+fn run_pulse_loop(out: watch::Sender<VolumeState>) -> Result<(), String> {
+    let mut proplist = Proplist::new().ok_or_else(|| String::from("failed to create proplist"))?;
+    proplist
+        .set_str(pulse::proplist::properties::APPLICATION_NAME, "i3status-dumb")
+        .map_err(|_| String::from("failed to set pulse application name"))?;
+
+    let mut mainloop =
+        Mainloop::new().ok_or_else(|| String::from("failed to create pulse mainloop"))?;
+    let mut context = Context::new_with_proplist(&mainloop, "i3status-dumb", &proplist)
+        .ok_or_else(|| String::from("failed to create pulse context"))?;
+
+    context
+        .connect(None, ContextFlagSet::NOFLAGS, None)
+        .map_err(|error| format!("{error:?}"))?;
+    wait_for_context_ready(&mut mainloop, &context)?;
+    request_default_sink_volume(&context, &mut mainloop, &out)?;
+
+    let (event_tx, event_rx) = mpsc::channel::<()>();
+    context.set_subscribe_callback(Some(Box::new(move |facility, operation, _| {
+        if should_refresh(facility, operation) {
+            let _ = event_tx.send(());
+        }
+    })));
+
+    let operation = context.subscribe(
+        InterestMaskSet::SINK | InterestMaskSet::SERVER | InterestMaskSet::CARD,
+        |_| {},
+    );
+    wait_for_operation(&mut mainloop, operation)?;
+
+    loop {
+        iterate(&mut mainloop)?;
+        while event_rx.try_recv().is_ok() {
+            request_default_sink_volume(&context, &mut mainloop, &out)?;
+        }
     }
 }
 
 pub fn spawn(tx: watch::Sender<VolumeState>) {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = watch_subscription(&tx).await {
-                eprintln!("i3status-dumb: volume watcher failed: {error}");
+            let join = tokio::task::spawn_blocking({
+                let tx = tx.clone();
+                move || run_pulse_loop(tx)
+            })
+            .await;
+
+            match join {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("i3status-dumb: pulse watcher failed: {error}"),
+                Err(error) => eprintln!("i3status-dumb: pulse watcher crashed: {error}"),
             }
 
             sleep(RETRY_DELAY).await;
@@ -146,27 +170,28 @@ pub fn spawn(tx: watch::Sender<VolumeState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_pactl_mute, parse_pactl_volume};
+    use super::{percent_from_raw, should_refresh};
+    use libpulse_binding::context::subscribe::{Facility, Operation};
+    use libpulse_binding::volume::Volume;
 
     #[test]
-    fn parses_first_percentage_token() {
-        assert_eq!(
-            parse_pactl_volume(b"Volume: front-left: 32768 /  50% / -18.06 dB"),
-            Some(50)
-        );
+    fn rounds_to_nearest_percent() {
+        assert_eq!(percent_from_raw(32_768, Volume::NORMAL.0), 50);
     }
 
     #[test]
-    fn parses_large_values_without_allocating() {
-        assert_eq!(
-            parse_pactl_volume(b"Volume: mono: 65536 / 150% / 0.00 dB"),
-            Some(150)
-        );
+    fn refreshes_on_sink_changes() {
+        assert!(should_refresh(
+            Some(Facility::Sink),
+            Some(Operation::Changed)
+        ));
     }
 
     #[test]
-    fn parses_muted_variants() {
-        assert_eq!(parse_pactl_mute(b"Mute: yes"), Some(true));
-        assert_eq!(parse_pactl_mute(b"Mute: false"), Some(false));
+    fn ignores_unrelated_events() {
+        assert!(!should_refresh(
+            Some(Facility::Client),
+            Some(Operation::Removed)
+        ));
     }
 }

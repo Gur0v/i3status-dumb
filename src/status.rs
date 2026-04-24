@@ -92,10 +92,6 @@ impl LayoutState {
         Self::from_bytes(out, len as u8)
     }
 
-    pub fn is_unknown(self) -> bool {
-        self == Self::UNKNOWN
-    }
-
     fn push_to(self, out: &mut String) {
         out.push_str(std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("??"));
     }
@@ -124,7 +120,6 @@ pub fn render_into(
     time: ClockState,
 ) -> &str {
     out.clear();
-    out.reserve(32);
     volume.push_to(out);
     out.push(' ');
     layout.push_to(out);

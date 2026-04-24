@@ -2,7 +2,7 @@ use std::mem::MaybeUninit;
 
 use libc::{localtime_r, strftime, time, time_t, tm};
 use tokio::sync::watch;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::status::ClockState;
 
@@ -41,6 +41,7 @@ pub fn now() -> ClockState {
 pub fn spawn(tx: watch::Sender<ClockState>) {
     tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             tick.tick().await;

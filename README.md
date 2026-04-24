@@ -1,74 +1,118 @@
 # i3status-dumb
 
-My tiny status generator for `swaybar` or `i3bar`.
+A tiny status generator for `swaybar`.
 
-I wrote this for my own setup and I am mostly throwing the source code out into the wild in case it is useful to someone else. It is not meant to be a general-purpose status bar or a polished replacement for anything.
+The name is now a lie.
 
-Prints one plain text line:
+This is no longer for i3. It is for `sway`. It used to shell out to random desktop tools like a tiny goblin. That goblin has been fired.
+
+Now it is written properly in Rust:
+
+* `swayipc-async` for keyboard layout events
+* `libpulse-binding` for volume and mute changes
+* no `pactl`
+* no `swaymsg`
+* no `setxkbmap`
+* no shell commands at runtime
+
+It still prints one plain text line:
 
 ```text
-42% us 2026-04-15 09:49:57 PM
+42% us 2026-04-24 09:49:57 PM
 ```
 
-The goal is simple:
+## What It Is
 
-- no giant config system
-- no JSON protocol layer
-- no polling spam for layout
-- fast updates when volume or keyboard layout changes
+A deliberately small status command for people who want:
 
-Right now it shows:
+* one binary
+* one line of output
+* no JSON bar protocol
+* no config language
+* no shell scripts glued together with spite
 
-- volume from PipeWire or PulseAudio tools
-- active keyboard layout
-- local clock, updated every second
+It watches three things:
+
+* default sink volume and mute state
+* active Sway keyboard layout
+* local clock
+
+When something changes, it prints a fresh line.
+
+## Philosophy
+
+Not literally suckless. Same idea:
+
+* small codebase
+* hardcoded behavior on purpose
+* minimal runtime dependencies
+* no knobs unless they earn their keep
+* talk to real APIs, not wrapper commands
+
+This is not a framework. It is not extensible. It is not trying to be helpful.
+
+It does one job and stops.
 
 ## How It Works
 
-The program runs three async watchers and prints a new line whenever any of them changes state.
+* `src/layout.rs`
+  Talks to Sway over IPC and listens for input events.
+* `src/volume.rs`
+  Connects to PulseAudio-compatible servers and listens for changes.
+* `src/clock.rs`
+  Ticks once per second.
+* `src/main.rs`
+  Merges state and prints the line.
 
-- `src/volume.rs`
-  Uses `pactl subscribe` for push events, then reads the default sink, volume, and mute state through `pactl`.
-- `src/layout.rs`
-  Auto-detects the session. On Sway it connects directly to `SWAYSOCK`, fetches current inputs, subscribes to `input` events, and extracts `xkb_active_layout_name`. Outside Sway it falls back to `setxkbmap -query`, which works for my i3/X11 setup.
-- `src/clock.rs`
-  Uses a `tokio` interval ticking once per second.
-- `src/main.rs`
-  Merges watcher updates through `tokio::sync::watch` channels and prints one new line on every change.
+## Scope
 
-## Assumptions
+Supported:
 
-This repo assumes a setup close to mine:
+* `sway`
+* PulseAudio or PipeWire (PulseAudio compatibility)
+* plain text output
 
-- Rust toolchain
-- `pactl`
-- either Sway with `SWAYSOCK` set, or i3/X11 with `setxkbmap`
+Not supported:
 
-On Arch I would install:
+* `i3`
+* X11
+* shell fallbacks
+* “just one more metric” requests
 
-```sh
-sudo pacman -S rust pipewire-pulse wireplumber
-```
+If you want a general-purpose status system, this is the wrong tool.
 
-On Debian or Ubuntu, probably:
+## X11 / i3 Support
 
-```sh
-sudo apt install cargo pulseaudio-utils wireplumber pipewire-bin
-```
+Gone for now.
 
-If your distro splits packages differently, the important part is:
+If you really want it, use v0.2.0:
+[https://github.com/Gur0v/i3status-dumb/releases/tag/v0.2.0](https://github.com/Gur0v/i3status-dumb/releases/tag/v0.2.0)
 
-- `pactl` command available
-- `setxkbmap` command available if you want i3/X11 layout support
-- active PipeWire or PulseAudio-compatible audio session
+If I ever end up using i3 again, which I probably will not, I will add X11 support back.
 
 ## Build
+
+You need Rust and PulseAudio client libraries.
+
+Arch:
+
+```sh
+sudo pacman -S rust pipewire-pulse libpulse
+```
+
+Debian / Ubuntu:
+
+```sh
+sudo apt install cargo libpulse-dev pipewire-pulse
+```
+
+Build:
 
 ```sh
 cargo build --release
 ```
 
-Binary path:
+Binary:
 
 ```text
 target/release/i3status-dumb
@@ -76,25 +120,21 @@ target/release/i3status-dumb
 
 ## Run
 
-Inside your WM session:
+Inside Sway:
 
 ```sh
 ./target/release/i3status-dumb
 ```
 
-You should see live-updating lines on stdout.
-
-## Use With `swaybar` or `i3bar`
-
-Example `~/.config/sway/config` or `~/.config/i3/config` block:
+## Use With Swaybar
 
 ```conf
 bar {
-    status_command /path/to/i3status-dumb/target/release/i3status-dumb
+    status_command /path/to/i3status-dumb
 }
 ```
 
-If you install system-wide:
+Or install:
 
 ```sh
 sudo install -m755 target/release/i3status-dumb /usr/local/bin/i3status-dumb
@@ -108,36 +148,20 @@ bar {
 }
 ```
 
-## Behavior Notes
+## Notes
 
-- Layout backend is auto-detected.
-- If `SWAYSOCK` is set, the Sway IPC watcher is used.
-- Otherwise the program falls back to `setxkbmap -query` for i3/X11.
-- If neither path works, layout stays `??`.
-- If audio tools cannot reach session daemon, volume stays `??%`.
-- Layout mapping currently special-cases:
-  - `English (US)` -> `us`
-  - `Russian` -> `ru`
-  - `Ukrainian` -> `ua`
-- Any other layout falls back to first 3 lowercase chars of layout name.
+* Layout comes from Sway input metadata
+* Mappings:
 
-## Why This Exists
+  * `English (US)` → `us`
+  * `Russian` → `ru`
+  * `Ukrainian` → `ua`
+* Others fall back to the first 3 lowercase ASCII letters
+* No PulseAudio → `??%`
+* No Sway IPC → `??`
 
-I did not want a pile of modules, a config format, or shell scripts spawning commands every second.
+## Status
 
-This stays intentionally small:
+Intentionally opinionated. Intentionally limited.
 
-- one binary
-- one line of output
-- direct Sway IPC when available
-- simple X11 fallback for i3
-- event-driven volume refresh
-- tiny codebase
-
-## Current Limits
-
-- only tested against my own Sway and i3-style setups
-- output format hardcoded
-- no battery, network, CPU, RAM, weather, or fancy bar protocol
-
-If you want all of that, this repo is probably the wrong starting point.
+That is the feature.
