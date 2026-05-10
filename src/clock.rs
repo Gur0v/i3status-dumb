@@ -5,6 +5,7 @@ use tokio::sync::watch;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::status::ClockState;
+use crate::util::publish_if_changed;
 
 const CLOCK_FORMAT: &[u8] = b"%Y-%m-%d %I:%M:%S %p\0";
 const CLOCK_LEN: usize = 22;
@@ -45,15 +46,7 @@ pub fn spawn(tx: watch::Sender<ClockState>) {
 
         loop {
             tick.tick().await;
-            let next = now();
-            let _ = tx.send_if_modified(|current| {
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            });
+            publish_if_changed(&tx, now());
         }
     });
 }

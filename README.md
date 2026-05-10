@@ -1,132 +1,53 @@
 # i3status-dumb
 
-A tiny status generator for `swaybar`.
+A tiny, opinionated status line generator for `swaybar`. No config. No surprises.
 
-The name is now a lie.
-
-This is no longer for i3. It is for `sway`. It used to shell out to random desktop tools like a tiny goblin. That goblin has been fired.
-
-Now it is written properly in Rust:
-
-* `swayipc-async` for keyboard layout events
-* `libpulse-binding` for volume and mute changes
-* no `pactl`
-* no `swaymsg`
-* no `setxkbmap`
-* no shell commands at runtime
-
-It still prints one plain text line:
+It watches three things: default sink volume, active keyboard layout, and the clock. When something changes, it prints a line:
 
 ```text
 42% us 2026-04-24 09:49:57 PM
 ```
 
-## What It Is
+That's the whole program.
 
-A deliberately small status command for people who want:
+## Implementation
 
-* one binary
-* one line of output
-* no JSON bar protocol
-* no config language
-* no shell scripts glued together with spite
+Event-driven Rust. No polling, no shelling out.
 
-It watches three things:
-
-* default sink volume and mute state
-* active Sway keyboard layout
-* local clock
-
-When something changes, it prints a fresh line.
+- `swayipc-async` for keyboard layout events
+- `libpulse-binding` for volume and mute changes
+- `src/layout.rs`, `src/volume.rs`, `src/clock.rs` feed into `src/main.rs`, which prints the line
 
 ## Philosophy
 
-Not literally suckless. Same idea:
+Small codebase. Hardcoded behavior on purpose. Talks to real APIs, not wrapper commands. Not a framework, not extensible by design. Does one job and stops.
 
-* small codebase
-* hardcoded behavior on purpose
-* minimal runtime dependencies
-* no knobs unless they earn their keep
-* talk to real APIs, not wrapper commands
-
-This is not a framework. It is not extensible. It is not trying to be helpful.
-
-It does one job and stops.
-
-## How It Works
-
-* `src/layout.rs`
-  Talks to Sway over IPC and listens for input events.
-* `src/volume.rs`
-  Connects to PulseAudio-compatible servers and listens for changes.
-* `src/clock.rs`
-  Ticks once per second.
-* `src/main.rs`
-  Merges state and prints the line.
+Want to add a metric? The source is the plugin system. Your imagination is the limit.
 
 ## Scope
 
-Supported:
+Supports `sway` and PulseAudio/PipeWire. Plain text output only. No i3, no X11, no shell fallbacks.
 
-* `sway`
-* PulseAudio or PipeWire (PulseAudio compatibility)
-* plain text output
-
-Not supported:
-
-* `i3`
-* X11
-* shell fallbacks
-* “just one more metric” requests
-
-If you want a general-purpose status system, this is the wrong tool.
-
-## X11 / i3 Support
-
-Gone for now.
-
-If you really want it, use v0.2.0:
-[https://github.com/Gur0v/i3status-dumb/releases/tag/v0.2.0](https://github.com/Gur0v/i3status-dumb/releases/tag/v0.2.0)
-
-If I ever end up using i3 again, which I probably will not, I will add X11 support back.
+For X11/i3, use [v0.2.0](https://github.com/Gur0v/i3status-dumb/releases/tag/v0.2.0).
 
 ## Build
 
-You need Rust and PulseAudio client libraries.
-
-Arch:
-
+**Arch:**
 ```sh
 sudo pacman -S rust pipewire-pulse libpulse
 ```
 
-Debian / Ubuntu:
-
+**Debian / Ubuntu:**
 ```sh
 sudo apt install cargo libpulse-dev pipewire-pulse
 ```
 
-Build:
-
 ```sh
 cargo build --release
+# binary: target/release/i3status-dumb
 ```
 
-Binary:
-
-```text
-target/release/i3status-dumb
-```
-
-## Run
-
-Inside Sway:
-
-```sh
-./target/release/i3status-dumb
-```
-
-## Use With Swaybar
+## Usage
 
 ```conf
 bar {
@@ -134,34 +55,12 @@ bar {
 }
 ```
 
-Or install:
+Install system-wide:
 
 ```sh
 sudo install -m755 target/release/i3status-dumb /usr/local/bin/i3status-dumb
 ```
 
-Then:
-
-```conf
-bar {
-    status_command i3status-dumb
-}
-```
-
 ## Notes
 
-* Layout comes from Sway input metadata
-* Mappings:
-
-  * `English (US)` → `us`
-  * `Russian` → `ru`
-  * `Ukrainian` → `ua`
-* Others fall back to the first 3 lowercase ASCII letters
-* No PulseAudio → `??%`
-* No Sway IPC → `??`
-
-## Status
-
-Intentionally opinionated. Intentionally limited.
-
-That is the feature.
+Layout mappings: `English (US)` → `us`, `Russian` → `ru`, `Ukrainian` → `ua`. Anything else truncates to 3 lowercase ASCII characters. No PulseAudio → `??%`. No Sway IPC → `??`.

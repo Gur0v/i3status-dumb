@@ -8,29 +8,13 @@ use pulse::context::{Context, FlagSet as ContextFlagSet, State as ContextState};
 use pulse::mainloop::standard::{IterateResult, Mainloop};
 use pulse::proplist::Proplist;
 use tokio::sync::watch;
-use tokio::time::{sleep, Duration};
 
 use crate::status::VolumeState;
-
-const RETRY_DELAY: Duration = Duration::from_secs(1);
-
-fn publish(tx: &watch::Sender<VolumeState>, next: VolumeState) {
-    let _ = tx.send_if_modified(|current| {
-        if *current == next {
-            false
-        } else {
-            *current = next;
-            true
-        }
-    });
-}
+use crate::util::{log_error, publish_if_changed, RetryBackoff};
 
 fn percent_from_raw(avg: u32, normal: u32) -> u16 {
     let normal = normal.max(1);
-    let rounded = avg
-        .saturating_mul(100)
-        .saturating_add(normal / 2)
-        / normal;
+    let rounded = avg.saturating_mul(100).saturating_add(normal / 2) / normal;
     rounded.min(999) as u16
 }
 
@@ -42,7 +26,9 @@ fn volume_from_sink(info: &SinkInfo<'_>) -> VolumeState {
 
 fn iterate(mainloop: &mut Mainloop) -> Result<(), String> {
     match mainloop.iterate(true) {
-        IterateResult::Quit(_) | IterateResult::Err(_) => Err(String::from("pulse mainloop stopped")),
+        IterateResult::Quit(_) | IterateResult::Err(_) => {
+            Err(String::from("pulse mainloop stopped"))
+        }
         IterateResult::Success(_) => Ok(()),
     }
 }
@@ -82,6 +68,7 @@ fn request_default_sink_volume(
     wait_for_operation(mainloop, operation)?;
 
     let Some(default_sink) = server_rx.recv().map_err(|error| error.to_string())? else {
+        publish_if_changed(out, VolumeState::UNKNOWN);
         return Ok(());
     };
 
@@ -97,23 +84,32 @@ fn request_default_sink_volume(
     wait_for_operation(mainloop, operation)?;
 
     if let Some(volume) = sink_rx.try_iter().last() {
-        publish(out, volume);
+        publish_if_changed(out, volume);
+    } else {
+        publish_if_changed(out, VolumeState::UNKNOWN);
     }
 
     Ok(())
 }
 
-fn should_refresh(facility: Option<Facility>, _operation: Option<Operation>) -> bool {
+fn should_refresh(facility: Option<Facility>, operation: Option<Operation>) -> bool {
     matches!(
-        facility,
-        Some(Facility::Sink) | Some(Facility::Server) | Some(Facility::Card)
+        (facility, operation),
+        (
+            Some(Facility::Sink),
+            Some(Operation::New | Operation::Changed | Operation::Removed)
+        ) | (Some(Facility::Server), Some(Operation::Changed))
+            | (Some(Facility::Card), Some(Operation::Changed))
     )
 }
 
-fn run_pulse_loop(out: watch::Sender<VolumeState>) -> Result<(), String> {
+fn connect_pulse() -> Result<(Mainloop, Context), String> {
     let mut proplist = Proplist::new().ok_or_else(|| String::from("failed to create proplist"))?;
     proplist
-        .set_str(pulse::proplist::properties::APPLICATION_NAME, "i3status-dumb")
+        .set_str(
+            pulse::proplist::properties::APPLICATION_NAME,
+            "i3status-dumb",
+        )
         .map_err(|_| String::from("failed to set pulse application name"))?;
 
     let mut mainloop =
@@ -125,6 +121,30 @@ fn run_pulse_loop(out: watch::Sender<VolumeState>) -> Result<(), String> {
         .connect(None, ContextFlagSet::NOFLAGS, None)
         .map_err(|error| format!("{error:?}"))?;
     wait_for_context_ready(&mut mainloop, &context)?;
+
+    Ok((mainloop, context))
+}
+
+fn run_pulse_once() -> Result<VolumeState, String> {
+    let (mut mainloop, context) = connect_pulse()?;
+    let (tx, rx) = watch::channel(VolumeState::UNKNOWN);
+    request_default_sink_volume(&context, &mut mainloop, &tx)?;
+    let volume = *rx.borrow();
+    Ok(volume)
+}
+
+pub fn current() -> VolumeState {
+    match run_pulse_once() {
+        Ok(volume) => volume,
+        Err(error) => {
+            log_error("pulse query failed", error);
+            VolumeState::UNKNOWN
+        }
+    }
+}
+
+fn run_pulse_loop(out: watch::Sender<VolumeState>) -> Result<(), String> {
+    let (mut mainloop, mut context) = connect_pulse()?;
     request_default_sink_volume(&context, &mut mainloop, &out)?;
 
     let (event_tx, event_rx) = mpsc::channel::<()>();
@@ -150,6 +170,8 @@ fn run_pulse_loop(out: watch::Sender<VolumeState>) -> Result<(), String> {
 
 pub fn spawn(tx: watch::Sender<VolumeState>) {
     tokio::spawn(async move {
+        let mut retry = RetryBackoff::new();
+
         loop {
             let join = tokio::task::spawn_blocking({
                 let tx = tx.clone();
@@ -158,12 +180,18 @@ pub fn spawn(tx: watch::Sender<VolumeState>) {
             .await;
 
             match join {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!("i3status-dumb: pulse watcher failed: {error}"),
-                Err(error) => eprintln!("i3status-dumb: pulse watcher crashed: {error}"),
+                Ok(Ok(())) => retry.reset(),
+                Ok(Err(error)) => {
+                    publish_if_changed(&tx, VolumeState::UNKNOWN);
+                    log_error("pulse watcher failed", error);
+                }
+                Err(error) => {
+                    publish_if_changed(&tx, VolumeState::UNKNOWN);
+                    log_error("pulse watcher crashed", error);
+                }
             }
 
-            sleep(RETRY_DELAY).await;
+            retry.wait().await;
         }
     });
 }
@@ -188,10 +216,23 @@ mod tests {
     }
 
     #[test]
+    fn refreshes_on_default_sink_changes() {
+        assert!(should_refresh(
+            Some(Facility::Server),
+            Some(Operation::Changed)
+        ));
+    }
+
+    #[test]
     fn ignores_unrelated_events() {
         assert!(!should_refresh(
             Some(Facility::Client),
             Some(Operation::Removed)
         ));
+    }
+
+    #[test]
+    fn ignores_unrelated_sink_operations() {
+        assert!(!should_refresh(Some(Facility::Sink), None));
     }
 }
